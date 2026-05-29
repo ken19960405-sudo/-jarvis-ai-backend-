@@ -1,0 +1,353 @@
+"""
+Jarvis AI 助理系統 - 雲端後端
+FastAPI + LangChain + WebSocket
+"""
+
+import os
+import json
+import asyncio
+import logging
+from typing import Optional
+from datetime import datetime
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import openai
+from langchain.agents import initialize_agent, Tool
+from langchain.llms import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+import tavily
+
+# 配置日誌
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 初始化 FastAPI
+app = FastAPI(title="Jarvis AI Backend")
+
+# CORS 配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 環境變數配置
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+
+# 初始化 OpenAI 客戶端
+openai.api_key = OPENAI_API_KEY
+
+# 初始化 Tavily 搜尋客戶端
+tavily_client = tavily.Client(api_key=TAVILY_API_KEY)
+
+# 全局變數
+active_connections = []
+user_memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+
+# ==================== 工具定義 ====================
+
+def web_search(query: str) -> str:
+    """
+    使用 Tavily API 進行網頁搜尋
+    """
+    try:
+        logger.info(f"搜尋查詢: {query}")
+        response = tavily_client.search(query=query, max_results=5)
+        
+        # 格式化搜尋結果
+        results = []
+        for result in response.get("results", []):
+            results.append({
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "content": result.get("content", "")[:200]
+            })
+        
+        return json.dumps(results, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"搜尋錯誤: {str(e)}")
+        return f"搜尋失敗: {str(e)}"
+
+
+def send_line_message(user_id: str, message: str) -> str:
+    """
+    發送 Line 訊息
+    """
+    try:
+        from linebot import LineBotApi
+        from linebot.models import TextSendMessage
+        
+        line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text=message)
+        )
+        return f"Line 訊息已發送給 {user_id}"
+    except Exception as e:
+        logger.error(f"Line 訊息發送失敗: {str(e)}")
+        return f"Line 訊息發送失敗: {str(e)}"
+
+
+def execute_local_command(command: str, params: dict = None) -> str:
+    """
+    執行本地命令
+    """
+    try:
+        command_data = {
+            "type": "execute_command",
+            "command": command,
+            "params": params or {}
+        }
+        
+        for connection in active_connections:
+            asyncio.create_task(connection.send_json(command_data))
+        
+        return f"命令已發送: {command}"
+    except Exception as e:
+        logger.error(f"命令執行失敗: {str(e)}")
+        return f"命令執行失敗: {str(e)}"
+
+
+def get_current_time() -> str:
+    """
+    獲取當前時間
+    """
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ==================== LangChain 代理設置 ====================
+
+tools = [
+    Tool(
+        name="Web Search",
+        func=web_search,
+        description="使用此工具搜尋網頁信息。輸入搜尋查詢。"
+    ),
+    Tool(
+        name="Send Line Message",
+        func=lambda user_id, message: send_line_message(user_id, message),
+        description="發送 Line 訊息。輸入 user_id 和訊息內容。"
+    ),
+    Tool(
+        name="Execute Local Command",
+        func=lambda command, params=None: execute_local_command(command, params),
+        description="執行本地命令。支持的命令: open_app, generate_file, control_mouse 等。"
+    ),
+    Tool(
+        name="Get Time",
+        func=get_current_time,
+        description="獲取當前時間。"
+    ),
+]
+
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.7,
+    openai_api_key=OPENAI_API_KEY
+)
+
+agent = initialize_agent(
+    tools,
+    llm,
+    agent="zero-shot-react-description",
+    memory=user_memory,
+    verbose=True
+)
+
+
+# ==================== 數據模型 ====================
+
+class AudioMessage(BaseModel):
+    """音頻消息模型"""
+    audio_base64: str
+    language: str = "zh-TW"
+
+
+class TextMessage(BaseModel):
+    """文本消息模型"""
+    text: str
+
+
+# ==================== API 端點 ====================
+
+@app.get("/health")
+async def health_check():
+    """健康檢查端點"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.post("/transcribe")
+async def transcribe_audio(message: AudioMessage):
+    """
+    轉錄音頻為文本
+    """
+    try:
+        import base64
+        import io
+        
+        audio_bytes = base64.b64decode(message.audio_base64)
+        
+        transcript = openai.Audio.transcribe(
+            model="whisper-1",
+            file=io.BytesIO(audio_bytes),
+            language=message.language
+        )
+        
+        return {
+            "text": transcript["text"],
+            "success": True
+        }
+    except Exception as e:
+        logger.error(f"轉錄失敗: {str(e)}")
+        return {
+            "text": "",
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.post("/process")
+async def process_text(message: TextMessage):
+    """
+    處理文本消息
+    """
+    try:
+        logger.info(f"處理文本: {message.text}")
+        
+        response = agent.run(message.text)
+        
+        return {
+            "response": response,
+            "success": True
+        }
+    except Exception as e:
+        logger.error(f"處理失敗: {str(e)}")
+        return {
+            "response": f"處理失敗: {str(e)}",
+            "success": False
+        }
+
+
+@app.post("/synthesize")
+async def synthesize_speech(message: TextMessage):
+    """
+    合成語音
+    """
+    try:
+        response = openai.Audio.create(
+            model="tts-1",
+            voice="alloy",
+            input=message.text,
+            language="zh"
+        )
+        
+        return {
+            "audio_url": response["url"],
+            "success": True
+        }
+    except Exception as e:
+        logger.error(f"語音合成失敗: {str(e)}")
+        return {
+            "audio_url": "",
+            "success": False,
+            "error": str(e)
+        }
+
+
+# ==================== WebSocket 端點 ====================
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket 端點用於實時通訊
+    """
+    await websocket.accept()
+    active_connections.append(websocket)
+    
+    try:
+        logger.info("客戶端已連接")
+        
+        while True:
+            data = await websocket.receive_json()
+            
+            message_type = data.get("type")
+            
+            if message_type == "audio":
+                audio_base64 = data.get("audio")
+                
+                transcript_response = await transcribe_audio(
+                    AudioMessage(audio_base64=audio_base64)
+                )
+                
+                if transcript_response["success"]:
+                    text = transcript_response["text"]
+                    logger.info(f"轉錄結果: {text}")
+                    
+                    process_response = await process_text(TextMessage(text=text))
+                    
+                    if process_response["success"]:
+                        response_text = process_response["response"]
+                        
+                        synthesize_response = await synthesize_speech(
+                            TextMessage(text=response_text)
+                        )
+                        
+                        await websocket.send_json({
+                            "type": "response",
+                            "text": response_text,
+                            "audio_url": synthesize_response.get("audio_url"),
+                            "success": True
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": process_response.get("response"),
+                            "success": False
+                        })
+                else:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "音頻轉錄失敗",
+                        "success": False
+                    })
+            
+            elif message_type == "text":
+                text = data.get("text")
+                process_response = await process_text(TextMessage(text=text))
+                
+                await websocket.send_json({
+                    "type": "response",
+                    "text": process_response.get("response"),
+                    "success": process_response.get("success")
+                })
+            
+            elif message_type == "command_result":
+                command = data.get("command")
+                result = data.get("result")
+                logger.info(f"命令執行結果 - {command}: {result}")
+    
+    except WebSocketDisconnect:
+        active_connections.remove(websocket)
+        logger.info("客戶端已斷開連接")
+    except Exception as e:
+        logger.error(f"WebSocket 錯誤: {str(e)}")
+        active_connections.remove(websocket)
+
+
+# ==================== 啟動配置 ====================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
