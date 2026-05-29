@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: jarvis-ai-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: OPENAI_API_KEY
+        scope: build,runtime
+      - key: TAVILY_API_KEY
+        scope: build,runtime
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        scope: build,runtime
+      - key: PORT
+        value: "8000"
